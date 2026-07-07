@@ -11,8 +11,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // defaultSocket is the local Unix-domain socket ccimgd listens on. The client's
@@ -210,8 +212,64 @@ ready:
 	conn.Write(data)
 }
 
+// version identifies the daemon build. It defaults to the VCS revision embedded
+// by `go build`; override at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+// usage is the short help text printed for -h/--help. %s is filled with the
+// default socket path; CCIMGD_SOCK overrides it at runtime.
+const usage = `ccimgd-unix — clipboard-image daemon (Unix-domain socket)
+
+Usage:
+  ccimgd-unix            start the daemon (blocks, serving the socket)
+  ccimgd-unix -h|--help  print this help and exit
+  ccimgd-unix --version  print version information and exit
+
+Environment:
+  CCIMGD_SOCK  socket path to listen on (default %s)
+`
+
+// versionString reports the build version: the explicit -ldflags value if set,
+// otherwise the VCS revision embedded by the Go toolchain, otherwise "dev".
+func versionString() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				return s.Value
+			}
+		}
+	}
+	return version
+}
+
 func main() {
+	// Handle informational flags before touching the socket: a stray
+	// `ccimgd-unix --help` or `--version` must never disturb a running daemon.
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "-h", "--help":
+			fmt.Printf(usage, defaultSocket)
+			os.Exit(0)
+		case "--version":
+			fmt.Printf("ccimgd-unix %s\n", versionString())
+			os.Exit(0)
+		}
+	}
+
 	path := socketPath()
+
+	// Singleton guard: if a daemon is already listening on this socket, refuse to
+	// start rather than clobbering the live endpoint. A successful Dial proves
+	// someone is accepting connections there; a failed Dial means the socket is
+	// stale or absent, so we fall through to the stale-socket cleanup below.
+	if conn, err := net.DialTimeout("unix", path, 200*time.Millisecond); err == nil {
+		conn.Close()
+		fmt.Fprintf(os.Stderr, "ccimgd already running at %s\n", path)
+		os.Exit(1)
+	}
 
 	// Remove a stale socket file left behind by a previous, non-clean shutdown.
 	// Without this, net.Listen("unix", ...) fails with EADDRINUSE ("address
