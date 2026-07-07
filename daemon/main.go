@@ -14,7 +14,6 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // defaultSocket is the local Unix-domain socket ccimgd listens on. The client's
@@ -251,7 +250,7 @@ func main() {
 	for _, arg := range os.Args[1:] {
 		switch arg {
 		case "-h", "--help":
-			fmt.Printf(usage, defaultSocket)
+			fmt.Printf(usage, socketPath())
 			os.Exit(0)
 		case "--version":
 			fmt.Printf("ccimgd-unix %s\n", versionString())
@@ -261,15 +260,30 @@ func main() {
 
 	path := socketPath()
 
-	// Singleton guard: if a daemon is already listening on this socket, refuse to
-	// start rather than clobbering the live endpoint. A successful Dial proves
-	// someone is accepting connections there; a failed Dial means the socket is
-	// stale or absent, so we fall through to the stale-socket cleanup below.
-	if conn, err := net.DialTimeout("unix", path, 200*time.Millisecond); err == nil {
-		conn.Close()
+	// Singleton guard: take an exclusive advisory lock on <socket>.lock BEFORE
+	// touching the socket. flock is atomic in the kernel and auto-released on
+	// process exit (including crash), so it closes the TOCTOU race a mere
+	// dial-probe leaves open: two daemons starting concurrently over a stale
+	// socket would both probe "nobody home", both os.Remove + Listen, and the
+	// second would clobber the first's fresh live socket. Holding the lock
+	// guarantees no other ccimgd is past this point, so the stale-remove +
+	// Listen below runs race-free.
+	//
+	// Known, out-of-scope caveat: if a /tmp cleaner deletes the .lock file out
+	// from under a running daemon, a new instance would create+lock a different
+	// inode and both could run. We accept this; not solved here.
+	lockPath := path + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot open lock %s: %v\n", lockPath, err)
+		os.Exit(1)
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		fmt.Fprintf(os.Stderr, "ccimgd already running at %s\n", path)
 		os.Exit(1)
 	}
+	// lf is intentionally kept open for the whole process lifetime: closing it
+	// (or letting it be GC'd) would release the flock. No defer Close.
 
 	// Remove a stale socket file left behind by a previous, non-clean shutdown.
 	// Without this, net.Listen("unix", ...) fails with EADDRINUSE ("address
