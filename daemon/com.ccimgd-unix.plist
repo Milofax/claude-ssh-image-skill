@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ccimgd-unix</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- Replace __HOME__ with your home directory, e.g. /Users/alice -->
+		<string>__HOME__/.local/bin/ccimgd-unix</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Local Unix socket the SSH RemoteForward on the Mini points at.
+		     Must match the RemoteForward target in ~/.ssh/config. -->
+		<key>CCIMGD_SOCK</key>
+		<string>/tmp/ccimgd-unix.sock</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/ccimgd-unix.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/ccimgd-unix.log</string>
+</dict>
+</plist>

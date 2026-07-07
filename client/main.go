@@ -7,12 +7,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 )
 
-const (
-	host = "127.0.0.1"
-	port = "9998"
-)
+// socketGlob matches the per-client Unix-domain sockets that each SSH session
+// exposes on the shared host via `RemoteForward /tmp/ccimg-<uniq>.sock ...`.
+// Multiple pasters (different clients/sessions) coexist as distinct paths.
+const socketGlob = "/tmp/ccimg-*.sock"
 
 type response struct {
 	OK    bool   `json:"ok"`
@@ -20,10 +21,64 @@ type response struct {
 	Error string `json:"error"`
 }
 
-func main() {
-	conn, err := net.Dial("tcp", net.JoinHostPort(host, port))
+// discoverSocket resolves which ccimgd socket to talk to.
+//
+//	(1) If CCIMG_SOCK is set, use exactly that path.
+//	(2) Otherwise enumerate socketGlob and pick the most recently modified one
+//	    (the paster that was active last). If several candidates exist, a short
+//	    warning is logged so it is clear which one was chosen.
+//	(3) If none exist, return a clear, actionable error.
+func discoverSocket() (string, error) {
+	if p := os.Getenv("CCIMG_SOCK"); p != "" {
+		return p, nil
+	}
+
+	matches, err := filepath.Glob(socketGlob)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to ccimgd: %v\n", err)
+		return "", fmt.Errorf("failed to enumerate sockets %s: %w", socketGlob, err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf(
+			"no ccimgd socket found (%s) — is the daemon running on the client "+
+				"and does your SSH session carry the RemoteForward?", socketGlob)
+	}
+
+	best := ""
+	var bestMod time.Time
+	for _, m := range matches {
+		info, err := os.Stat(m)
+		if err != nil {
+			continue // vanished between glob and stat, or unreadable
+		}
+		if best == "" || info.ModTime().After(bestMod) {
+			best, bestMod = m, info.ModTime()
+		}
+	}
+	if best == "" {
+		return "", fmt.Errorf(
+			"no usable ccimgd socket found among %d candidate(s) matching %s",
+			len(matches), socketGlob)
+	}
+
+	if len(matches) > 1 {
+		fmt.Fprintf(os.Stderr,
+			"ccimg: %d ccimgd sockets found; using most recently modified: %s\n",
+			len(matches), best)
+	}
+
+	return best, nil
+}
+
+func main() {
+	sockPath, err := discoverSocket()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to ccimgd at %s: %v\n", sockPath, err)
 		os.Exit(1)
 	}
 	defer conn.Close()
