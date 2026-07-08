@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 )
@@ -210,8 +211,79 @@ ready:
 	conn.Write(data)
 }
 
+// version identifies the daemon build. It defaults to the VCS revision embedded
+// by `go build`; override at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+// usage is the short help text printed for -h/--help. %s is filled with the
+// default socket path; CCIMGD_SOCK overrides it at runtime.
+const usage = `ccimgd-unix — clipboard-image daemon (Unix-domain socket)
+
+Usage:
+  ccimgd-unix            start the daemon (blocks, serving the socket)
+  ccimgd-unix -h|--help  print this help and exit
+  ccimgd-unix --version  print version information and exit
+
+Environment:
+  CCIMGD_SOCK  socket path to listen on (default %s)
+`
+
+// versionString reports the build version: the explicit -ldflags value if set,
+// otherwise the VCS revision embedded by the Go toolchain, otherwise "dev".
+func versionString() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" {
+				return s.Value
+			}
+		}
+	}
+	return version
+}
+
 func main() {
+	// Handle informational flags before touching the socket: a stray
+	// `ccimgd-unix --help` or `--version` must never disturb a running daemon.
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "-h", "--help":
+			fmt.Printf(usage, socketPath())
+			os.Exit(0)
+		case "--version":
+			fmt.Printf("ccimgd-unix %s\n", versionString())
+			os.Exit(0)
+		}
+	}
+
 	path := socketPath()
+
+	// Singleton guard: take an exclusive advisory lock on <socket>.lock BEFORE
+	// touching the socket. flock is atomic in the kernel and auto-released on
+	// process exit (including crash), so it closes the TOCTOU race a mere
+	// dial-probe leaves open: two daemons starting concurrently over a stale
+	// socket would both probe "nobody home", both os.Remove + Listen, and the
+	// second would clobber the first's fresh live socket. Holding the lock
+	// guarantees no other ccimgd is past this point, so the stale-remove +
+	// Listen below runs race-free.
+	//
+	// Known, out-of-scope caveat: if a /tmp cleaner deletes the .lock file out
+	// from under a running daemon, a new instance would create+lock a different
+	// inode and both could run. We accept this; not solved here.
+	lockPath := path + ".lock"
+	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cannot open lock %s: %v\n", lockPath, err)
+		os.Exit(1)
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		fmt.Fprintf(os.Stderr, "ccimgd already running at %s\n", path)
+		os.Exit(1)
+	}
+	// lf is intentionally kept open for the whole process lifetime: closing it
+	// (or letting it be GC'd) would release the flock. No defer Close.
 
 	// Remove a stale socket file left behind by a previous, non-clean shutdown.
 	// Without this, net.Listen("unix", ...) fails with EADDRINUSE ("address
